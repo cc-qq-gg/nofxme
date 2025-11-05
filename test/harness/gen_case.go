@@ -4,470 +4,444 @@
 package main
 
 import (
-	"bufio"
-	"encoding/json"
 	"flag"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io/ioutil"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 
 	"gopkg.in/yaml.v3"
 )
 
-// RequestSpec mirrors the harness CaseSpec.Request
+// Lightweight case YAML structures
 type RequestSpec struct {
-	Method  string                 `json:"method" yaml:"method"`
-	Path    string                 `json:"path" yaml:"path"`
-	Headers map[string]string      `json:"headers,omitempty" yaml:"headers,omitempty"`
-	Body    map[string]interface{} `json:"body,omitempty" yaml:"body,omitempty"`
+	Method  string                 `yaml:"method"`
+	Path    string                 `yaml:"path"`
+	Headers map[string]string      `yaml:"headers,omitempty"`
+	Body    map[string]interface{} `yaml:"body,omitempty"`
 }
 
-// ExpectSpec mirrors the harness CaseSpec.Expect
 type ExpectSpec struct {
-	Status int                    `json:"status" yaml:"status"`
-	Body   map[string]interface{} `json:"body,omitempty" yaml:"body,omitempty"`
+	Status int                    `yaml:"status"`
+	Body   map[string]interface{} `yaml:"body,omitempty"`
 }
 
-// CaseYAML is the structure we'll write to case.yml
 type CaseYAML struct {
 	Name    string      `yaml:"name"`
 	Request RequestSpec `yaml:"request"`
 	Expect  ExpectSpec  `yaml:"expect"`
 }
 
-func readMaybeFileOrJSON(raw string) ([]byte, error) {
-	if raw == "" {
-		return nil, nil
-	}
-	// If starts with @ treat as file path
-	if strings.HasPrefix(raw, "@") {
-		p := strings.TrimPrefix(raw, "@")
-		b, err := ioutil.ReadFile(p)
-		if err != nil {
-			return nil, err
-		}
-		return b, nil
-	}
-	// Otherwise treat as JSON string
-	return []byte(raw), nil
-}
-
-func parseRequest(raw string) (RequestSpec, error) {
-	if raw == "" {
-		// default stub: POST
-		return RequestSpec{Method: "POST"}, nil
-	}
-	b, err := readMaybeFileOrJSON(raw)
+// Helper: write YAML file
+func writeCaseYAML(path string, c CaseYAML) error {
+	b, err := yaml.Marshal(&c)
 	if err != nil {
-		return RequestSpec{}, err
+		return err
 	}
-	var r RequestSpec
-	if err := json.Unmarshal(b, &r); err != nil {
-		// try YAML as fallback
-		if err2 := yaml.Unmarshal(b, &r); err2 == nil {
-			return r, nil
-		}
-		return RequestSpec{}, fmt.Errorf("failed to parse request spec: %v (json err) / %v (yaml err)", err, err2)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
 	}
-	return r, nil
+	return ioutil.WriteFile(path, b, 0o644)
 }
 
-func parseExpect(raw string) (ExpectSpec, error) {
-	if raw == "" {
-		return ExpectSpec{Status: 200}, nil
+// AST-based extractor
+func findFunctionAndTypes(rootDir, target string) (funcFile string, funcDecl *ast.FuncDecl, typeFields map[string][]string, fset *token.FileSet, err error) {
+	// typeFields maps typeName -> field json names
+	typeFields = map[string][]string{}
+	fset = token.NewFileSet()
+	// support target forms: "Func" or "Receiver.Func"
+	recvName := ""
+	funcName := target
+	if strings.Contains(target, ".") {
+		parts := strings.SplitN(target, ".", 2)
+		recvName = parts[0]
+		funcName = parts[1]
 	}
-	b, err := readMaybeFileOrJSON(raw)
-	if err != nil {
-		return ExpectSpec{}, err
-	}
-	var e ExpectSpec
-	if err := json.Unmarshal(b, &e); err != nil {
-		if err2 := yaml.Unmarshal(b, &e); err2 == nil {
-			return e, nil
-		}
-		return ExpectSpec{}, fmt.Errorf("failed to parse expect spec: %v (json err) / %v (yaml err)", err, err2)
-	}
-	return e, nil
-}
 
-// findHandlerFile searches .go files for a function matching handlerName (methodName)
-// supports methods with receiver: func (s *Server) handleLogin(c *gin.Context)
-// returns the file path and the function body as string
-func findHandlerFile(handlerName string) (string, string, error) {
-	var files []string
-	_ = filepath.Walk(".", func(path string, info os.FileInfo, err error) error {
-		if err != nil {
+	// walk files
+	err = filepath.Walk(rootDir, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
 			return nil
 		}
 		if info.IsDir() {
+			// skip vendor and test data
+			if info.Name() == "vendor" || info.Name() == ".git" {
+				return filepath.SkipDir
+			}
 			return nil
 		}
-		if strings.HasSuffix(path, ".go") {
-			files = append(files, path)
+		if !strings.HasSuffix(path, ".go") {
+			return nil
 		}
-		return nil
-	})
-
-	fnRegexes := []*regexp.Regexp{
-		regexp.MustCompile(`func\s+\(.*\)\s*` + regexp.QuoteMeta(handlerName) + `\s*\(`),
-		regexp.MustCompile(`func\s+` + regexp.QuoteMeta(handlerName) + `\s*\(`),
-	}
-
-	for _, f := range files {
-		b, _ := ioutil.ReadFile(f)
-		s := string(b)
-		for _, rex := range fnRegexes {
-			loc := rex.FindStringIndex(s)
-			if loc != nil {
-				// find opening brace after this location
-				open := strings.Index(s[loc[1]:], "{")
-				if open == -1 {
-					continue
-				}
-				start := loc[1] + open
-				// now find matching closing brace
-				count := 0
-				end := -1
-				for i := start; i < len(s); i++ {
-					if s[i] == '{' {
-						count++
-					} else if s[i] == '}' {
-						count--
-						if count == 0 {
-							end = i
-							break
+		// parse file
+		f, perr := parser.ParseFile(fset, path, nil, parser.ParseComments)
+		if perr != nil {
+			return nil
+		}
+		// collect type structs
+		for _, decl := range f.Decls {
+			gdecl, ok := decl.(*ast.GenDecl)
+			if !ok || gdecl.Tok != token.TYPE {
+				continue
+			}
+			for _, spec := range gdecl.Specs {
+				tspec := spec.(*ast.TypeSpec)
+				if st, ok := tspec.Type.(*ast.StructType); ok {
+					fields := []string{}
+					for _, f := range st.Fields.List {
+						// determine json tag or field name
+						name := ""
+						if f.Tag != nil {
+							t := strings.Trim(f.Tag.Value, "`")
+							// find json:"..."
+							for _, part := range strings.Split(t, " ") {
+								if strings.HasPrefix(part, "json:") {
+									jsonTag := strings.TrimPrefix(part, "json:")
+									jsonTag = strings.Trim(jsonTag, `"`)
+									if jsonTag != "-" && jsonTag != "" {
+										name = strings.Split(jsonTag, ",")[0]
+									}
+								}
+							}
+						}
+						if name == "" && len(f.Names) > 0 {
+							name = strings.ToLower(f.Names[0].Name)
+						}
+						if name != "" {
+							fields = append(fields, name)
 						}
 					}
+					if len(fields) > 0 {
+						typeFields[tspec.Name.Name] = fields
+					}
 				}
-				if end != -1 {
-					body := s[start+1 : end]
-					return f, body, nil
+			}
+		}
+		// find function decl
+		for _, decl := range f.Decls {
+			if fd, ok := decl.(*ast.FuncDecl); ok && fd.Name != nil && fd.Name.Name == funcName {
+				// if receiver specified, check receiver type
+				if recvName != "" {
+					if fd.Recv == nil || len(fd.Recv.List) == 0 {
+						continue
+					}
+					// receiver type could be *Server or Server
+					recvType := ""
+					switch expr := fd.Recv.List[0].Type.(type) {
+					case *ast.StarExpr:
+						if id, ok := expr.X.(*ast.Ident); ok {
+							recvType = id.Name
+						}
+					case *ast.Ident:
+						recvType = expr.Name
+					}
+					if recvType != recvName {
+						continue
+					}
 				}
-			}
-		}
-	}
-	return "", "", fmt.Errorf("handler %s not found", handlerName)
-}
-
-// extractRequestFields tries to find a ShouldBindJSON(&var) and resolve the struct fields
-func extractRequestFields(funcBody, fileDir string) map[string]interface{} {
-	out := map[string]interface{}{}
-	// find ShouldBindJSON(&varName) or BindJSON(&varName)
-	rex := regexp.MustCompile(`ShouldBindJSON\s*\(\s*&\s*([A-Za-z0-9_]+)\s*\)|BindJSON\s*\(\s*&\s*([A-Za-z0-9_]+)\s*\)|ShouldBind\s*\(\s*&\s*([A-Za-z0-9_]+)\s*\)`)
-	m := rex.FindStringSubmatch(funcBody)
-	var varName string
-	for i := 1; i < len(m); i++ {
-		if m[i] != "" {
-			varName = m[i]
-			break
-		}
-	}
-	if varName == "" {
-		return out
-	}
-	// search for 'var varName <Type>' or 'varName := <Type>{' or 'varName := <Type>' in function body
-	// pattern: var <varName> <Type>
-	varTypeR := regexp.MustCompile(`var\s+` + regexp.QuoteMeta(varName) + `\s+([A-Za-z0-9_]+)`)
-	if mm := varTypeR.FindStringSubmatch(funcBody); len(mm) >= 2 {
-		typeName := mm[1]
-		// search for type definition in repository
-		if fields := findStructFields(typeName); len(fields) > 0 {
-			for k := range fields {
-				out[k] = ""
-			}
-		}
-		return out
-	}
-	// look for '<varName> := <Type>{' inline literal
-	litR := regexp.MustCompile(regexp.QuoteMeta(varName) + `\s*:=\s*struct\s*\{([^}]*)\}`)
-	if mm := litR.FindStringSubmatch(funcBody); len(mm) >= 2 {
-		body := mm[1]
-		fields := parseStructFieldsFromBody(body)
-		for k := range fields {
-			out[k] = ""
-		}
-		return out
-	}
-	// case: varName := Type{} (no inline fields) -> try to find type
-	shortR := regexp.MustCompile(regexp.QuoteMeta(varName) + `\s*:?=\s*([A-Za-z0-9_]+)`)
-	if mm := shortR.FindStringSubmatch(funcBody); len(mm) >= 2 {
-		typeName := mm[1]
-		if fields := findStructFields(typeName); len(fields) > 0 {
-			for k := range fields {
-				out[k] = ""
-			}
-		}
-	}
-	return out
-}
-
-// findStructFields looks for 'type TypeName struct { ... }' across repository and returns map of json field names
-func findStructFields(typeName string) map[string]string {
-	res := map[string]string{}
-	_ = filepath.Walk(".", func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() || !strings.HasSuffix(path, ".go") {
-			return nil
-		}
-		b, _ := ioutil.ReadFile(path)
-		s := string(b)
-		rex := regexp.MustCompile(`type\s+` + regexp.QuoteMeta(typeName) + `\s+struct\s*\{([\s\S]*?)\}`)
-		if mm := rex.FindStringSubmatch(s); len(mm) >= 2 {
-			body := mm[1]
-			fields := parseStructFieldsFromBody(body)
-			for k, v := range fields {
-				res[k] = v
+				// found
+				funcFile = path
+				funcDecl = fd
+				return filepath.SkipDir // stop walking
 			}
 		}
 		return nil
 	})
-	return res
-}
-
-// parseStructFieldsFromBody parses field lines like 'Email string `json:"email"`' and returns map json->type
-func parseStructFieldsFromBody(body string) map[string]string {
-	out := map[string]string{}
-	s := bufio.NewScanner(strings.NewReader(body))
-	for s.Scan() {
-		line := strings.TrimSpace(s.Text())
-		if line == "" {
-			continue
-		}
-		// split by spaces
-		parts := strings.Fields(line)
-		if len(parts) < 2 {
-			continue
-		}
-		// last part may include tag
-		tag := ""
-		if strings.Contains(line, "`json:") {
-			// extract json tag
-			re := regexp.MustCompile(`json:"([^\"]+)"`)
-			if mm := re.FindStringSubmatch(line); len(mm) >= 2 {
-				tag = mm[1]
-			}
-		}
-		varName := parts[0]
-		if tag == "" {
-			// fallback to lowercased field name
-			tag = strings.ToLower(varName)
-		}
-		out[tag] = parts[1]
+	if funcDecl == nil {
+		return "", nil, typeFields, fset, fmt.Errorf("function %s not found", target)
 	}
-	return out
+	return funcFile, funcDecl, typeFields, fset, nil
 }
 
-// extractResponseFields tries to heuristically find c.JSON(..., gin.H{ ... }) and extract keys
-func extractResponseFields(funcBody string) map[string]interface{} {
-	out := map[string]interface{}{}
-	// find gin.H{ ... }
-	re := regexp.MustCompile(`gin\.H\s*\{([\s\S]*?)}`)
-	if mm := re.FindStringSubmatch(funcBody); len(mm) >= 2 {
-		inside := mm[1]
-		// find keys like "key": or key:
-		reKey := regexp.MustCompile(`(?m)(?:"([^"]+)"|([a-zA-Z0-9_]+))\s*:\s*`)
-		ks := reKey.FindAllStringSubmatch(inside, -1)
-		for _, k := range ks {
-			if k[1] != "" {
-				out[k[1]] = ""
-			} else if k[2] != "" {
-				out[k[2]] = ""
-			}
+// inspect function AST to find request struct variable bound by ShouldBindJSON/BindJSON and response gin.H keys
+func inspectFunc(fd *ast.FuncDecl, typeFields map[string][]string) (requestFields []string, responseKeys []string, routePath string) {
+	// traverse body and look for call expressions
+	ast.Inspect(fd.Body, func(n ast.Node) bool {
+		ce, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
 		}
-		return out
-	}
-	// fallback: look for c.JSON with struct variable -> not implemented
-	return out
-}
 
-// findRouteForHandler attempts to find the registered route path for a handler
-// by scanning source files for router registration calls like api.POST("/login", s.handleLogin)
-func findRouteForHandler(handlerName string) string {
-	verbs := []string{"POST", "GET", "PUT", "DELETE", "PATCH", "Any"}
-	// scan all .go files line-by-line
-	_ = filepath.Walk(".", func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() || !strings.HasSuffix(path, ".go") {
-			return nil
+		// check function is a selector expression (e.g., c.ShouldBindJSON or c.JSON)
+		sel, isSel := ce.Fun.(*ast.SelectorExpr)
+		if !isSel {
+			return true
 		}
-		data, err := ioutil.ReadFile(path)
-		if err != nil {
-			return nil
-		}
-		lines := strings.Split(string(data), "\n")
-		for i, line := range lines {
-			for _, v := range verbs {
-				// look for verb usage, e.g. POST("/api/xxx",
-				if strings.Contains(line, v+"(") || strings.Contains(line, strings.ToLower(v)+"(") {
-					// try extract quoted path in the line
-					rePath := regexp.MustCompile(`"([^"]+)"`)
-					if mm := rePath.FindStringSubmatch(line); len(mm) >= 2 {
-						pathStr := mm[1]
-						// if handlerName appears in same line or within next 3 lines, consider it a match
-						if strings.Contains(line, handlerName) {
-							returnVal := pathStr
-							// write returnVal to a temp file marker and later read it outside. Simpler: set an env var — but we are in same process; instead, panic with a sentinel containing path, and recover outside. But that's messy. Simpler: create a package-level global variable routeFound and set it here.
-							routeFound = returnVal
-							return fmt.Errorf("stopwalk")
-						}
-						// look ahead up to 3 lines for handlerName
-						for j := i; j <= i+3 && j < len(lines); j++ {
-							if strings.Contains(lines[j], handlerName) {
-								routeFound = pathStr
-								return fmt.Errorf("stopwalk")
+
+		mname := sel.Sel.Name
+
+		// 1) Request binding: ShouldBindJSON/BindJSON/ShouldBind/Bind
+		if mname == "ShouldBindJSON" || mname == "BindJSON" || mname == "ShouldBind" || mname == "Bind" {
+			if len(ce.Args) >= 1 {
+				// expect first arg like &var
+				if ua, ok := ce.Args[0].(*ast.UnaryExpr); ok {
+					if id, ok := ua.X.(*ast.Ident); ok {
+						vname := id.Name
+						// find vname declaration or assignment in function body
+						var vType string
+						ast.Inspect(fd.Body, func(n2 ast.Node) bool {
+							// value spec: var vname Type
+							if vs, ok := n2.(*ast.ValueSpec); ok {
+								for _, nm := range vs.Names {
+									if nm.Name == vname {
+										if vs.Type != nil {
+											if idt, ok := vs.Type.(*ast.Ident); ok {
+												vType = idt.Name
+											}
+										}
+									}
+								}
+							}
+							// assign stmt: vname := Type{}
+							if as, ok := n2.(*ast.AssignStmt); ok {
+								for i, lhs := range as.Lhs {
+									if ident, ok := lhs.(*ast.Ident); ok && ident.Name == vname {
+										if len(as.Rhs) > i {
+											if cl, ok := as.Rhs[i].(*ast.CompositeLit); ok {
+												if idt, ok := cl.Type.(*ast.Ident); ok {
+													vType = idt.Name
+												}
+											}
+										}
+									}
+								}
+							}
+							return true
+						})
+						// if vType known, append its fields
+						if vType != "" {
+							if flds, ok := typeFields[vType]; ok {
+								requestFields = append(requestFields, flds...)
 							}
 						}
 					}
 				}
 			}
 		}
-		return nil
+
+		// 2) Response JSON: c.JSON(status, gin.H{...})
+		if mname == "JSON" {
+			if len(ce.Args) >= 2 {
+				if cl, ok := ce.Args[1].(*ast.CompositeLit); ok {
+					if se, ok := cl.Type.(*ast.SelectorExpr); ok {
+						if ident, ok := se.X.(*ast.Ident); ok && ident.Name == "gin" && se.Sel.Name == "H" {
+							for _, e := range cl.Elts {
+								if kv, ok := e.(*ast.KeyValueExpr); ok {
+									switch k := kv.Key.(type) {
+									case *ast.BasicLit:
+										key := strings.Trim(k.Value, `"`)
+										responseKeys = append(responseKeys, key)
+									case *ast.Ident:
+										responseKeys = append(responseKeys, k.Name)
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		return true
 	})
-	// if walk was stopped with our sentinel, routeFound will be set
-	return routeFound
+
+	// detect route via AST scanning
+	routePath = detectRouteForFunc(fd.Name.Name)
+	return
 }
 
-// package-level variable to capture found route inside filepath.Walk
-var routeFound string
+// detectRouteForFunc uses simple AST search for calls like r.POST("/path", handler)
+// It also attempts to resolve a group prefix when the router variable comes from a Group("/prefix") call.
+func detectRouteForFunc(funcName string) string {
+	fset := token.NewFileSet()
+	var found string
+	_ = filepath.Walk(".", func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() || !strings.HasSuffix(path, ".go") {
+			return nil
+		}
+		f, perr := parser.ParseFile(fset, path, nil, 0)
+		if perr != nil {
+			return nil
+		}
+		// map of identifier -> group prefix (if assigned by .Group("/prefix"))
+		prefixMap := map[string]string{}
+		ast.Inspect(f, func(n ast.Node) bool {
+			// look for assignments like api := router.Group("/api") or api := s.router.Group("/api")
+			if as, ok := n.(*ast.AssignStmt); ok {
+				for i, rhs := range as.Rhs {
+					if ce, ok := rhs.(*ast.CallExpr); ok {
+						if sel, ok := ce.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "Group" {
+							// first arg string literal
+							if len(ce.Args) >= 1 {
+								if bl, ok := ce.Args[0].(*ast.BasicLit); ok {
+									prefix := strings.Trim(bl.Value, `"`)
+									if i < len(as.Lhs) {
+										if id, ok := as.Lhs[i].(*ast.Ident); ok {
+											prefixMap[id.Name] = prefix
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+			return true
+		})
+
+		ast.Inspect(f, func(n ast.Node) bool {
+			ce, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			// fun could be SelectorExpr like api.POST
+			if sel, ok := ce.Fun.(*ast.SelectorExpr); ok {
+				m := sel.Sel.Name
+				if m == "POST" || m == "GET" || m == "PUT" || m == "DELETE" || m == "PATCH" || m == "Any" {
+					// first arg maybe path
+					if len(ce.Args) >= 1 {
+						if bl, ok := ce.Args[0].(*ast.BasicLit); ok && bl.Kind == token.STRING {
+							pathStr := strings.Trim(bl.Value, `"`)
+							// check if handler name appears among args
+							for _, a := range ce.Args[1:] {
+								s := fmt.Sprint(a)
+								if strings.Contains(s, funcName) {
+									// resolve prefix if selector receiver is an identifier bound to Group
+									prefix := ""
+									if id, ok := sel.X.(*ast.Ident); ok {
+										if p, ok2 := prefixMap[id.Name]; ok2 {
+											prefix = p
+										}
+									}
+									if prefix != "" && strings.HasPrefix(pathStr, "/") {
+										// combine and ensure single slash
+										returnVal := strings.TrimRight(prefix, "/") + pathStr
+										found = returnVal
+									} else {
+										found = pathStr
+									}
+									return false
+								}
+							}
+						}
+					}
+				}
+			}
+			return true
+		})
+		if found != "" {
+			return fmt.Errorf("stopwalk")
+		}
+		return nil
+	})
+	return found
+}
 
 func main() {
-	var reqRaw string
-	var expectRaw string
-	flag.StringVar(&reqRaw, "req", "", "request spec JSON or @file")
-	flag.StringVar(&expectRaw, "expect", "", "expect spec JSON or @file")
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: go run %s <Receiver.Optional>.<Func> or <Func> [caseName]\n", os.Args[0])
+		flag.PrintDefaults()
+	}
 	flag.Parse()
 	args := flag.Args()
 	if len(args) < 1 {
-		fmt.Println("usage: go run test/harness/gen_case.go [flags] <methodName> [caseName]")
-		flag.PrintDefaults()
+		flag.Usage()
 		os.Exit(1)
 	}
-	method := args[0]
+	target := args[0]
 	caseName := "case01"
 	if len(args) >= 2 {
 		caseName = args[1]
 	}
 
-	baseDir := filepath.Join("test", method)
-	caseDir := filepath.Join(baseDir, caseName)
-	prepDir := filepath.Join(caseDir, "PrepareData")
-	checkDir := filepath.Join(caseDir, "CheckData")
-
-	// create directories (PrepareData/CheckData will be empty unless user provides CSVs)
-	if err := os.MkdirAll(prepDir, 0o755); err != nil {
-		fmt.Printf("failed to create PrepareData dir: %v\n", err)
+	root := "."
+	funcFile, fd, typeFields, _, err := findFunctionAndTypes(root, target)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(2)
 	}
-	if err := os.MkdirAll(checkDir, 0o755); err != nil {
-		fmt.Printf("failed to create CheckData dir: %v\n", err)
-		os.Exit(3)
+	fmt.Printf("found function in %s\n", funcFile)
+
+	reqFields, respKeys, route := inspectFunc(fd, typeFields)
+
+	// build CaseYAML
+	req := RequestSpec{Method: "POST", Path: "", Headers: map[string]string{}, Body: map[string]interface{}{}}
+	if route != "" {
+		req.Path = route
+	} else {
+		req.Path = "/api/" + fd.Name.Name
+	}
+	for _, k := range reqFields {
+		req.Body[k] = ""
+	}
+	if len(req.Body) == 0 {
+		// create a placeholder because sometimes we couldn't infer
+		req.Body["example_field"] = ""
 	}
 
-	// try to locate handler and extract fields heuristically
-	hFile, hBody, _ := findHandlerFile(method)
-	var reqFields map[string]interface{}
-	var respFields map[string]interface{}
-	if hFile != "" {
-		reqFields = extractRequestFields(hBody, filepath.Dir(hFile))
-		respFields = extractResponseFields(hBody)
-	}
-
-	// parse flags and fallbacks
-	rSpec, err := parseRequest(reqRaw)
-	if err != nil {
-		fmt.Printf("parse request spec failed: %v\n", err)
-		os.Exit(4)
-	}
-	eSpec, err := parseExpect(expectRaw)
-	if err != nil {
-		fmt.Printf("parse expect spec failed: %v\n", err)
-		os.Exit(5)
-	}
-
-	// merge detected fields into request/expect bodies if they are empty
-	if (rSpec.Body == nil || len(rSpec.Body) == 0) && len(reqFields) > 0 {
-		rSpec.Body = reqFields
-	}
-	if (eSpec.Body == nil || len(eSpec.Body) == 0) && len(respFields) > 0 {
-		eSpec.Body = respFields
-	}
-
-	// attempt to detect registered route for handler and use it (overrides default path)
-	if rSpec.Path == "" {
-		if route := findRouteForHandler(method); route != "" {
-			rSpec.Path = route
+	exp := ExpectSpec{Status: 200, Body: map[string]interface{}{}}
+	for _, k := range respKeys {
+		// heuristics
+		if strings.Contains(strings.ToLower(k), "token") || strings.Contains(strings.ToLower(k), "id") {
+			exp.Body[k] = "EXISTS:true"
+		} else {
+			exp.Body[k] = "*"
 		}
 	}
-
-	// fill defaults if missing
-	if rSpec.Path == "" {
-		rSpec.Path = "/api/" + method
-	}
-	if rSpec.Method == "" {
-		rSpec.Method = "POST"
-	}
-	if eSpec.Status == 0 {
-		eSpec.Status = 200
+	if len(exp.Body) == 0 {
+		exp.Body["example_response_field"] = "*"
 	}
 
-	// generate case.yml dynamically
 	cy := CaseYAML{
-		Name:    method + " " + caseName,
-		Request: rSpec,
-		Expect:  eSpec,
+		Name:    fd.Name.Name + " " + caseName,
+		Request: req,
+		Expect:  exp,
 	}
-	b, err := yaml.Marshal(&cy)
+	outPath := filepath.Join("test", fd.Name.Name, caseName, "case.yml")
+	if err := writeCaseYAML(outPath, cy); err != nil {
+		fmt.Fprintf(os.Stderr, "write case.yml failed: %v\n", err)
+		os.Exit(3)
+	}
+	// ensure PrepareData/CheckData dirs exist
+	_ = os.MkdirAll(filepath.Join("test", fd.Name.Name, caseName, "PrepareData"), 0o755)
+	_ = os.MkdirAll(filepath.Join("test", fd.Name.Name, caseName, "CheckData"), 0o755)
+
+	fmt.Printf("generated %s\n", outPath)
+
+	// Generate harness-style test wrapper under test/<Func>/<case>/<Func>_test.go
+	testDir := filepath.Join("test", fd.Name.Name, caseName)
+	if err := os.MkdirAll(testDir, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "create test dir failed: %v\n", err)
+		os.Exit(4)
+	}
+	testFilePath := filepath.Join(testDir, fd.Name.Name+"_test.go")
+	f2, err := os.Create(testFilePath)
 	if err != nil {
-		fmt.Printf("yaml marshal failed: %v\n", err)
-		os.Exit(6)
+		fmt.Fprintf(os.Stderr, "create test file failed: %v\n", err)
+		os.Exit(5)
 	}
-	caseYmlPath := filepath.Join(caseDir, "case.yml")
-	if err := ioutil.WriteFile(caseYmlPath, b, 0o644); err != nil {
-		fmt.Printf("write case.yml failed: %v\n", err)
-		os.Exit(7)
-	}
+	defer f2.Close()
 
-	// generate test file (non-hardcoded, but simple harness wrapper)
-	testFile := filepath.Join(baseDir, fmt.Sprintf("%s_test.go", method))
-	testContent := fmt.Sprintf(`// @Target(%s)
-package %s
+	// write harness-style test
+	pkgName := fd.Name.Name // use function name as package (folder already named so this is okay)
+	// ensure valid package name: use lowercase
+	pkgName = strings.ToLower(pkgName)
+	fmt.Fprintf(f2, "// @Target(%s)\n", fd.Name.Name)
+	fmt.Fprintf(f2, "package %s\n\n", pkgName)
+	fmt.Fprintln(f2, "import (")
+	fmt.Fprintln(f2, "\t\"testing\"")
+	fmt.Fprintln(f2, "\t\"nofx/test/harness\"")
+	fmt.Fprintln(f2, ")\n")
+	// struct and hooks
+	fmt.Fprintf(f2, "// %sTest 嵌入 BaseTest，可按需重写 Before/After 钩子\n", strings.Title(fd.Name.Name))
+	fmt.Fprintf(f2, "type %sTest struct {\n\tharness.BaseTest\n}\n\n", strings.Title(fd.Name.Name))
+	fmt.Fprintf(f2, "func (rt *%sTest) Before(t *testing.T) {\n\trt.BaseTest.Before(t)\n\tif rt.Env != nil {\n\t\tt.Logf(\"TestEnv API URL: %%s\", rt.Env.URL())\n\t} else {\n\t\tt.Log(\"Warning: Env is nil in Before\")\n\t}\n}\n\n", strings.Title(fd.Name.Name))
+	fmt.Fprintf(f2, "func (rt *%sTest) After(t *testing.T) {\n\t// no-op\n}\n\n", strings.Title(fd.Name.Name))
+	fmt.Fprintf(f2, "// @RunWith(%s)\nfunc Test%s(t *testing.T) {\n\trt := &%sTest{}\n\tharness.RunCase(t, rt)\n}\n", caseName, strings.Title(fd.Name.Name), strings.Title(fd.Name.Name))
 
-import (
-    "testing"
-
-    "nofx/test/harness"
-)
-
-// %sTest 嵌入 BaseTest，可按需重写 Before/After 钩子
-type %sTest struct {
-    harness.BaseTest
-}
-
-func (rt *%sTest) Before(t *testing.T) {
-    rt.BaseTest.Before(t)
-    if rt.Env != nil {
-        t.Logf("TestEnv API URL: %s", rt.Env.URL())
-    } else {
-        t.Log("Warning: Env is nil in Before")
-    }
-}
-
-func (rt *%sTest) After(t *testing.T) {
-    // no-op
-}
-
-// @RunWith(%s)
-func Test%s(t *testing.T) {
-    rt := &%sTest{}
-    harness.RunCase(t, rt)
-}
-`, method, method, strings.Title(method), strings.Title(method), strings.Title(method), strings.Title(method), caseName, strings.Title(method), strings.Title(method))
-	if err := ioutil.WriteFile(testFile, []byte(testContent), 0o644); err != nil {
-		fmt.Printf("write test file failed: %v\n", err)
-		os.Exit(8)
-	}
-
-	fmt.Printf("generated test scaffolding for method '%s' at %s\n", method, baseDir)
-	fmt.Printf("case.yml path: %s\n", caseYmlPath)
+	fmt.Printf("generated %s\n", testFilePath)
 }

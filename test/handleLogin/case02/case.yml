@@ -6,8 +6,9 @@ request:
       email: testuser@example.com
       password: secret123
 expect:
-    status: 401
+    status: 200
     body:
-        error: '账户未完成OTP设置'
-        requires_otp_setup: true
+        email: 'testuser@example.com'
+        message: '请输入Google Authenticator验证码'
+        requires_otp: true
         user_id: 1

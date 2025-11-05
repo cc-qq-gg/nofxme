@@ -1,4 +1,4 @@
-name: register case01
+name: register case01 已注册再注册
 request:
   method: POST
   path: /api/register
