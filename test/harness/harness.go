@@ -430,6 +430,13 @@ func runSingleCaseWithEnv(t *testing.T, caseDir string, env *TestEnv) {
 	for k, v := range cs.Request.Headers {
 		req.Header.Set(k, v)
 	}
+	// If test harness runs in admin mode and caller didn't set Authorization,
+	// automatically add a test JWT so protected endpoints succeed.
+	if auth.IsAdminMode() && req.Header.Get("Authorization") == "" {
+		if token, err := auth.GenerateJWT("admin", "admin@localhost"); err == nil {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+	}
 	if len(reqBody) > 0 && req.Header.Get("Content-Type") == "" {
 		req.Header.Set("Content-Type", "application/json")
 	}
