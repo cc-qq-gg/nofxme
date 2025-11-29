@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"nofx/utils"
 
 	"github.com/ethereum/go-ethereum/crypto"
 )
@@ -72,7 +73,7 @@ func NewLighterTrader(privateKeyHex string, walletAddr string, testnet bool) (*L
 		ctx:             context.Background(),
 		privateKey:      privateKey,
 		walletAddr:      walletAddr,
-		client:          &http.Client{Timeout: 30 * time.Second},
+		client:          utils.CreateHTTPClient(30),
 		baseURL:         baseURL,
 		testnet:         testnet,
 		symbolPrecision: make(map[string]SymbolPrecision),

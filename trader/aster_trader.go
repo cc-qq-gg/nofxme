@@ -13,6 +13,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/url"
+	"nofx/utils"
 	"nofx/hook"
 	"sort"
 	"strconv"
@@ -57,14 +58,12 @@ func NewAsterTrader(user, signer, privateKeyHex string) (*AsterTrader, error) {
 	if err != nil {
 		return nil, fmt.Errorf("解析私钥失败: %w", err)
 	}
-	client := &http.Client{
-		Timeout: 30 * time.Second, // 增加到30秒
-		Transport: &http.Transport{
-			TLSHandshakeTimeout:   10 * time.Second,
-			ResponseHeaderTimeout: 10 * time.Second,
-			IdleConnTimeout:       90 * time.Second,
-		},
+	transport := &http.Transport{
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 10 * time.Second,
+		IdleConnTimeout:       90 * time.Second,
 	}
+	client := utils.CreateHTTPClientWithTransport(30, transport)
 	res := hook.HookExec[hook.NewAsterTraderResult](hook.NEW_ASTER_TRADER, user, client)
 	if res != nil && res.Error() == nil {
 		client = res.GetResult()

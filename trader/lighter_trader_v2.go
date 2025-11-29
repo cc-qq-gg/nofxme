@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"nofx/utils"
 
 	lighterClient "github.com/elliottech/lighter-go/client"
 	lighterHTTP "github.com/elliottech/lighter-go/client/http"
@@ -94,7 +95,7 @@ func NewLighterTraderV2(l1PrivateKeyHex, walletAddr, apiKeyPrivateKeyHex string,
 		ctx:              context.Background(),
 		privateKey:       l1PrivateKey,
 		walletAddr:       walletAddr,
-		client:           &http.Client{Timeout: 30 * time.Second},
+		client:           utils.CreateHTTPClient(30),
 		baseURL:          baseURL,
 		testnet:          testnet,
 		chainID:          chainID,

@@ -13,6 +13,7 @@ import (
 	"nofx/crypto"
 	"nofx/decision"
 	"nofx/hook"
+	"nofx/utils"
 	"nofx/manager"
 	"nofx/trader"
 	"strconv"
@@ -254,9 +255,7 @@ func getPublicIPFromAPI() string {
 		"https://ifconfig.me",
 	}
 
-	client := &http.Client{
-		Timeout: 5 * time.Second,
-	}
+	client := utils.CreateHTTPClient(5)
 
 	for _, service := range services {
 		resp, err := client.Get(service)
